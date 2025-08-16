@@ -1,0 +1,72 @@
+# ------------------------
+# Python
+# ------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+*.egg
+.venv/
+venv/
+.env
+*.log
+
+# ------------------------
+# Virtual environments
+# ------------------------
+venv/
+.env/
+.envrc
+
+# ------------------------
+# Data + results (large or reproducible)
+# ------------------------
+data/
+features/
+results/
+
+# ------------------------
+# Reports / compiled outputs
+# ------------------------
+reports/*.pdf
+reports/*.docx
+reports/*.odt
+# keep source files like .tex if you want them versioned
+
+# ------------------------
+# Audio files
+# ------------------------
+*.wav
+*.flac
+*.ogg
+*.mp3
+*.m4a
+
+# ------------------------
+# Generated CSV/TSV outputs
+# ------------------------
+*.csv
+*.tsv
+*.raven.tsv
+
+# ------------------------
+# Jupyter / notebooks cache
+# ------------------------
+.ipynb_checkpoints/
+
+# ------------------------
+# OS / editor junk
+# ------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# ------------------------
+# Backup / temp
+# ------------------------
+*~
