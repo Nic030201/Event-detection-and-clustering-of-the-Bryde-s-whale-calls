@@ -10,13 +10,52 @@ from scipy.signal import butter, filtfilt, get_window, stft
 from scipy.ndimage import median_filter
 import ruptures as rpt
 from scipy.signal import find_peaks
+import argparse
 
+# --- Directories (based on your tree) ---
+PROJ_ROOT   = Path(__file__).resolve().parents[1]
+DATA_DIR    = PROJ_ROOT / "data" / "chunks"   # where your WAV + label files live
+OUT_DIR     = PROJ_ROOT / "results"           # all detections/outputs
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_file(name_or_path: str | Path, base: Path) -> Path:
+    p = Path(name_or_path)
+    # 1) direct hit (absolute or relative to CWD)
+    if p.is_file():
+        return p.resolve()
+    # 2) relative to project root (lets you pass 'data/chunks/1hrsamples/x.wav')
+    q = (PROJ_ROOT / p).resolve()
+    if q.is_file():
+        return q
+    # 3) under the base directory (e.g., data/chunks/<arg>)
+    q = (base / p).resolve()
+    if q.is_file():
+        return q
+    # 4) last resort: search by filename anywhere under base
+    hits = list(base.rglob(p.name))
+    if hits:
+        return hits[0].resolve()
+    raise FileNotFoundError(f"Could not find '{name_or_path}'. "
+                            f"Tried CWD, PROJ_ROOT, {base}, and recursive search.")
+
+def default_out_path(audio_path: Path, suffix: str) -> Path:
+    """results/<audio_stem>_<suffix>.csv"""
+    return (OUT_DIR / f"{audio_path.stem}_{suffix}").with_suffix(".csv")
+
+def add_common_args(parser: argparse.ArgumentParser):
+    parser.add_argument("--audio",  required=True,
+                        help="Audio file (filename in data/chunks or full path).")
+    parser.add_argument("--labels", default=None,
+                        help="Label file (filename in same folder or full path).")
+    parser.add_argument("--out",    default=None,
+                        help="Output CSV path (defaults to results/<audio_stem>_output.csv).")
 
 # ------------------- paths -------------------
-HERE = Path(__file__).resolve().parent
-AUDIO_PATH   = (HERE / "APR22_s1.wav").resolve()
-LABELS_PATH  = (HERE / "APR22_s1_selections.txt").resolve()
-OUT_DETS_CSV = (HERE / "APR22_s1_detections.csv").resolve()
+# HERE = Path(__file__).resolve().parent
+# AUDIO_PATH   = (HERE / "APR22_s1.wav").resolve()
+# LABELS_PATH  = (HERE / "APR22_s1_selections.txt").resolve()
+# OUT_DETS_CSV = (HERE / "APR22_s1_detections.csv").resolve()
 
 # ------------------- front-end filtering & framing -------------------
 # Recall-first band: keep low anchor + upper energy
@@ -395,14 +434,27 @@ def local_cpd_refine(
 
 # ------------------- main -------------------
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Offline CPD")
+    add_common_args(parser)
+    args = parser.parse_args()
+
+    AUDIO_PATH = resolve_file(args.audio, DATA_DIR)
+    LABELS_PATH = resolve_file(args.labels, DATA_DIR) if args.labels else None
+    OUT_DETS_CSV = Path(args.out) if args.out else default_out_path(AUDIO_PATH, "detections")
+    OUT_DETS_CSV.parent.mkdir(parents=True, exist_ok=True)
+
     # Audio + labels
     x, fs = sf.read(AUDIO_PATH)
     if x.ndim > 1: x = x.mean(axis=1)
     x = x.astype(np.float32)
 
-    raw_df = pd.read_csv(LABELS_PATH, sep="\t", engine="python")
-    gt = read_raven_table(LABELS_PATH, prefer_channel=None, dedupe_tol=1e-3)
-    print(f"Raw GT rows: {len(raw_df)} | Unique selections after de-dupe: {len(gt)}")
+    gt = None
+    if LABELS_PATH:
+        raw_df = pd.read_csv(LABELS_PATH, sep="\t", engine="python")
+        gt = read_raven_table(LABELS_PATH, prefer_channel=None, dedupe_tol=1e-3)
+        print(f"Raw GT rows: {len(raw_df)} | Unique selections after de-dupe: {len(gt)}")
+    else:
+        print("No labels provided: skipping evaluation.")
 
     # Front-end filter
     b, a = butter_bandpass(LOW_HZ, HIGH_HZ, fs, order=4)
@@ -520,7 +572,7 @@ if __name__ == "__main__":
             "td_energy_med": float(np.median(td_energy[s:e])) if e > s else 0.0,
         }
         rows.append(row)
-    feats_csv = OUT_DETS_CSV.with_name("events_for_gmm.csv")
+    feats_csv = default_out_path(AUDIO_PATH, "events_for_gmm")
     pd.DataFrame(rows).to_csv(feats_csv, index=False)
     print(f"Saved features for GMM: {feats_csv} (n={len(rows)})")
 
