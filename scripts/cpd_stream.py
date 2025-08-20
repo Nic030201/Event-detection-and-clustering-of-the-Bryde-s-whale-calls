@@ -64,15 +64,15 @@ FRAME_S = 0.050
 HOP_S   = 0.010
 
 # ------------------- post-proc durations -------------------
-MIN_EVENT_S = 0.25
-MIN_GAP_S   = 0.05
+MIN_EVENT_S = 0.20
+MIN_GAP_S   = 0.03
 ONSET_TOL_S = 0.25
 
 # ------------------- CPD preset (recall tilt) -------------------
 MODEL    = "l2"
-PENALTY  = 50.0
-Z_THRESH = 1.35
-SMOOTH_S = 0.80
+PENALTY  = 40.0
+Z_THRESH = 1.25
+SMOOTH_S = 0.70
 
 # ------------------- STFT config for spectral features -------------------
 SPEC_NFFT   = 2048
@@ -85,12 +85,12 @@ TD_BAND     = (150.0, 220.0)  # exported only
 # valley split is inside split_events_by_valley()
 # band-limited flux peak splitter:
 PEAK_BAND            = (80.0, 220.0)
-PEAK_SMOOTH_S        = 0.15
-PEAK_MIN_DIST_S      = 0.45
+PEAK_SMOOTH_S        = 0.12
+PEAK_MIN_DIST_S      = 0.40
 PEAK_VALLEY_MIN_S    = 0.05
-PEAK_MIN_PIECE_S     = 0.20
-PEAK_MIN_PROM_FRAC   = 0.08
-PEAK_HEIGHT_FRAC     = 0.18
+PEAK_MIN_PIECE_S     = 0.16
+PEAK_MIN_PROM_FRAC   = 0.06
+PEAK_HEIGHT_FRAC     = 0.15
 
 # local CPD refine:
 LOCAL_PEN_RATIO      = 0.70
@@ -278,7 +278,7 @@ def split_by_anchor_valleys(
     dets, P, f_axis, hop_s,
     band=(35.0, 50.0),
     smooth_s=0.12,
-    valley_drop_frac=0.18,  
+    valley_drop_frac=0.16,  
     min_valley_s=0.05,
     min_piece_s=0.18
 ):
@@ -590,9 +590,9 @@ def detect_on_chunk(x_chunk, fs):
         dets, P, f_axis, HOP_S,
         band=(35.0, 50.0),
         smooth_s=0.12,
-        valley_drop_frac=0.22,
+        valley_drop_frac=0.18,
         min_valley_s=0.05,
-        min_piece_s=0.20
+        min_piece_s=0.18
     )
 
     # local CPD refine
