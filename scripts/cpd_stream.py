@@ -1,7 +1,6 @@
-# CPD_streaming.py
+# CPD_streaming.py (clean)
 # Streaming (chunked) runner for your Bryde's CPD detector on very long audio (e.g., 72h).
-# Built from your latest single-file script: same features, CPD, and splitters,
-# but runs in overlapping chunks and stitches results in global time.
+# Same features/CPD/splitters as your latest script, but tidied and de-duped.
 
 import numpy as np
 import pandas as pd
@@ -12,7 +11,6 @@ from scipy.ndimage import median_filter
 import ruptures as rpt
 import time
 import argparse
-
 
 # --- Directories (based on your tree) ---
 PROJ_ROOT   = Path(__file__).resolve().parents[1]
@@ -52,14 +50,8 @@ def add_common_args(parser: argparse.ArgumentParser):
     parser.add_argument("--out",    default=None,
                         help="Output CSV path (defaults to results/<audio_stem>_output.csv).")
 
-
-
-# ------------------- chunking -------------------
-CHUNK_S   = 600.0   # 10 min chunks; adjust to your RAM/IO constraints
-
-
 # ------------------- front-end filtering & framing -------------------
-LOW_HZ, HIGH_HZ = 35, 300           # your current passband
+LOW_HZ, HIGH_HZ = 35, 300           # passband
 FRAME_S = 0.050
 HOP_S   = 0.010
 
@@ -97,11 +89,8 @@ LOCAL_PEN_RATIO      = 0.70
 LOCAL_MIN_EVENT_S    = 0.25
 LOCAL_MIN_SEP_S      = 0.60
 
-# ------------------- Stage B toggle (keep OFF while maximising recall) -------------------
-APPLY_STAGE_B = False
-
 # =======================================================================================
-#                                  Core helpers (your code)
+#                                  Core helpers
 # =======================================================================================
 _t0 = time.time()
 
@@ -114,7 +103,7 @@ def _progress(chunk_idx, start_frame, n_frames_total, fs, total_kept):
     print(f"[{chunk_idx:04d}] {done_s/3600:6.2f}/{total_s/3600:6.2f} h  "
           f"({frac*100:5.1f}%) | kept={total_kept} | "
           f"elapsed={elapsed/60:5.1f}m  ETA={eta_s/60:5.1f}m")
-    
+
 def butter_bandpass(low, high, fs, order=4):
     ny = 0.5 * fs
     b, a = butter(order, [low/ny, high/ny], btype="band")
@@ -133,7 +122,7 @@ def frame_signal(x, fs, frame_s, hop_s, window="hann"):
         writeable=False
     ).copy()
     frames *= W[None, :]
-    times = np.arange(n_frames)*hop_s
+    times = np.arange(n_frames)*hop_s   # only used for alignment
     return frames, times
 
 def frame_rms_from_frames(frames):
@@ -196,36 +185,6 @@ def read_raven_table(path: Path, prefer_channel=None, dedupe_tol=1e-3) -> pd.Dat
             .reset_index(drop=True))
     return gt
 
-def det_onsets_from_cross(dets, z, hop_s, z_lo):
-    ons = []
-    z = np.asarray(z, dtype=np.float32)
-    for ts, te in dets:
-        s = int(round(ts / hop_s)); e = max(s+1, int(round(te / hop_s)))
-        seg = z[s:e]
-        if seg.size == 0: continue
-        above = np.flatnonzero(seg >= z_lo)
-        idx = above[0] if above.size else int(seg.argmax())
-        ons.append((s + idx) * hop_s)
-    return np.array(ons, dtype=np.float32)
-
-def evaluate_with_cross(dets, gt, tol_s, z, hop_s, z_lo):
-    det_on = det_onsets_from_cross(dets, z, hop_s, z_lo)
-    if det_on.size == 0:
-        return 0.0, 0.0, 0.0, 0, 0, len(gt)
-    gt_on = gt["start_s"].values
-    used_det = np.zeros(len(det_on), bool); used_gt = np.zeros(len(gt_on), bool)
-    tp = 0
-    for i, t in enumerate(gt_on):
-        diffs = np.abs(det_on - t); diffs[used_det] = np.inf
-        j = int(np.argmin(diffs))
-        if diffs[j] <= tol_s:
-            used_det[j] = True; used_gt[i] = True; tp += 1
-    fp = int((~used_det).sum()); fn = int((~used_gt).sum())
-    p = tp/(tp+fp) if (tp+fp) else 0.0
-    r = tp/(tp+fn) if (tp+fn) else 0.0
-    f1 = 2*p*r/(p+r) if (p+r) else 0.0
-    return p, r, f1, tp, fp, fn
-
 def split_events_by_valley(
     dets, z, hop_s,
     z_split,
@@ -273,12 +232,11 @@ def split_events_by_valley(
             merged.append([st, en])
     return merged
 
-
 def split_by_anchor_valleys(
     dets, P, f_axis, hop_s,
     band=(35.0, 50.0),
     smooth_s=0.12,
-    valley_drop_frac=0.16,  
+    valley_drop_frac=0.16,
     min_valley_s=0.05,
     min_piece_s=0.18
 ):
@@ -433,6 +391,35 @@ def split_by_bandflux_peaks(
             merged.append([st, en])
     return merged
 
+class RobustZEMA:
+    def __init__(self, alpha=0.05, eps=1e-12):
+        self.alpha, self.eps = alpha, eps
+        self.med = None; self.mad = None
+    def __call__(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        med = float(np.median(x))
+        mad = float(np.median(np.abs(x - med))) + self.eps
+        if self.med is None:
+            self.med, self.mad = med, mad
+        else:
+            a = self.alpha
+            self.med = (1-a)*self.med + a*med
+            self.mad = (1-a)*self.mad + a*mad
+        return (x - self.med) / (1.4826*self.mad + self.eps)
+
+rz_rms, rz_flux, rz_nb, rz_tone, rz_ent = RobustZEMA(), RobustZEMA(), RobustZEMA(), RobustZEMA(), RobustZEMA()
+
+def band_entropy_tonality(P, f_axis, band):
+    m = (f_axis >= band[0]) & (f_axis <= band[1])
+    if not np.any(m):
+        return np.zeros(P.shape[1], dtype=np.float32)
+    sub = P[m, :].astype(np.float32) + 1e-12
+    sub = sub / sub.sum(axis=0, keepdims=True)
+    H = -(sub * np.log2(sub)).sum(axis=0)
+    Hnorm = H / (np.log2(max(int(m.sum()), 2)))  # 0..1
+    return (1.0 - Hnorm).astype(np.float32)      # high = tonal
+
+
 def local_cpd_refine(
     dets, z_scalar, hop_s,
     model="l2",
@@ -470,50 +457,12 @@ def local_cpd_refine(
     return out
 
 
-# define once (top-level)
-class RobustZEMA:
-    def __init__(self, alpha=0.05, eps=1e-12):
-        self.alpha, self.eps = alpha, eps
-        self.med = None; self.mad = None
-    def __call__(self, x):
-        import numpy as np
-        x = np.asarray(x, dtype=np.float32)
-        med = float(np.median(x))
-        mad = float(np.median(np.abs(x - med))) + self.eps
-        if self.med is None:
-            self.med, self.mad = med, mad
-        else:
-            a = self.alpha
-            self.med = (1-a)*self.med + a*med
-            self.mad = (1-a)*self.mad + a*mad
-        return (x - self.med) / (1.4826*self.mad + self.eps)
-
-rz_rms, rz_flux, rz_nb, rz_tone, rz_ent = RobustZEMA(), RobustZEMA(), RobustZEMA(), RobustZEMA(), RobustZEMA()
-    
-
-
-
-def band_entropy_tonality(P, f_axis, band):
-    import numpy as np
-    m = (f_axis >= band[0]) & (f_axis <= band[1])
-    if not np.any(m):
-        return np.zeros(P.shape[1], dtype=np.float32)
-    sub = P[m, :].astype(np.float32) + 1e-12
-    sub = sub / sub.sum(axis=0, keepdims=True)
-    H = -(sub * np.log2(sub)).sum(axis=0)
-    Hnorm = H / (np.log2(max(int(m.sum()), 2)))  # 0..1
-    return (1.0 - Hnorm).astype(np.float32)      # high = tonal
-
-
-
-
 # =======================================================================================
-#                           Per-chunk detector 
+#                           Per-chunk detector
 # =======================================================================================
-def detect_on_chunk(x_chunk, fs):
-    """Run your full pipeline on one audio chunk. Returns:
-       dets_local: [[st, en] in seconds, relative to chunk 0],
-       z, hop_s, nb_ratio, tonality, rms, flux, P, f_axis (for feature export)."""
+def detect_on_chunk(x_chunk, fs, chunk_s):
+    """Run pipeline on one padded audio chunk.
+       Returns dets_local (seconds relative to padded t0) and per-frame features needed by caller."""
     # filter
     b, a = butter_bandpass(LOW_HZ, HIGH_HZ, fs, order=4)
     xf = filtfilt(b, a, x_chunk)
@@ -528,21 +477,20 @@ def detect_on_chunk(x_chunk, fs):
     L = min(len(times), len(t_stft), len(rms), len(flux), P.shape[1])
     times = times[:L]; rms = rms[:L]; flux = flux[:L]; P = P[:, :L]
 
-
-    # rolling/smoothing window – define this BEFORE any median_filter calls
+    # smoothing window
     k = max(1, int(round(SMOOTH_S / HOP_S)))
 
     # entropy-based tonality in mid band (ST/MT focus)
-    ENT_BAND = (70.0, 160.0)  # or (70,160) if ST is your priority
+    ENT_BAND = (70.0, 160.0)
     ent_mid  = band_entropy_tonality(P, f_axis, ENT_BAND)
     z_ent    = rz_ent(median_filter(ent_mid, size=k))
 
     nb_ratio = per_frame_narrowband_ratio(P, f_axis)
     tonality = per_frame_anchor_tonality(P, f_axis)
     td_slope_hzs = downsweep_slope_hz_per_s(P, f_axis, HOP_S, band=TD_BAND)  # exported only
-    td_energy    = P[band_mask(f_axis, *TD_BAND), :].sum(axis=0)            # exported only
+    td_energy    = P[band_mask(f_axis, *TD_BAND), :].sum(axis=0)             # exported only
 
-    #rolling z-scores
+    # rolling z-scores
     z_rms  = rz_rms( median_filter(rms,      size=k) )
     z_flux = rz_flux(median_filter(flux,     size=k) )
     z_nb   = rz_nb(  median_filter(nb_ratio, size=k) )
@@ -554,13 +502,13 @@ def detect_on_chunk(x_chunk, fs):
 
     # CPD → candidates
     min_size_frames = max(3, int(round(MIN_EVENT_S / HOP_S)))
-
     n_frames_here = len(z)
-    BASE_N = int(round(600.0 / HOP_S))  # 10 min reference (same as CHUNK_S default)
+
+    # scale penalty to the configured chunk length (single source of truth)
+    BASE_N = int(round(max(chunk_s, 1e-6) / HOP_S))
     penalty_here = max(1.0, PENALTY * (np.log(max(n_frames_here,2)) / np.log(max(BASE_N,2))))
 
     segs = segments_from_cpd(z, HOP_S, penalty_here, model=MODEL, min_size_frames=min_size_frames)
-
     dets = pick_event_segments(z, segs, Z_THRESH, MIN_EVENT_S, MIN_GAP_S, HOP_S)
 
     # Valley split
@@ -585,7 +533,7 @@ def detect_on_chunk(x_chunk, fs):
         height_frac=PEAK_HEIGHT_FRAC
     )
 
-    # --- new: micro-split on anchor envelope (helps ST/MT multi-pulse) ---
+    # micro-split on anchor envelope (helps ST/MT multi-pulse)
     dets = split_by_anchor_valleys(
         dets, P, f_axis, HOP_S,
         band=(35.0, 50.0),
@@ -604,24 +552,19 @@ def detect_on_chunk(x_chunk, fs):
         min_sep_s=LOCAL_MIN_SEP_S
     )
 
-
-    # after you get `dets` (post-split + local refine)
+    # entropy/nb rescue
     rescue_ct = 0
-
     accepted = []
     for st, en in dets:
         s = int(round(st / HOP_S)); e = max(s+1, int(round(en / HOP_S)))
         if e <= s: 
             continue
-
-        z_med  = float(np.median(z[s:e]))
-        z_p75  = float(np.percentile(z[s:e], 75))
+        z_med   = float(np.median(z[s:e]))
+        z_p75   = float(np.percentile(z[s:e], 75))
         ent_med = float(np.median(z_ent[s:e]))
-        nb_med  = float(np.median(z_nb[s:e]))  # note: z_nb is the z-scored nb_ratio
-
-        keep_main = (z_med > (Z_THRESH - 0.1)) and (z_p75 > 0.8*Z_THRESH)
+        nb_med  = float(np.median(z_nb[s:e]))  # z-scored nb_ratio
+        keep_main   = (z_med > (Z_THRESH - 0.1)) and (z_p75 > 0.8*Z_THRESH)
         keep_rescue = (ent_med > 0.38) and (nb_med > 0.08) and ((en - st) >= 0.16)
-
         if keep_main or keep_rescue:
             accepted.append([st, en])
             if (not keep_main) and keep_rescue:
@@ -630,8 +573,8 @@ def detect_on_chunk(x_chunk, fs):
     dets = accepted
     print(f"Rescued by entropy: {rescue_ct}")
 
-
-    return dets, z, nb_ratio, tonality, rms, flux, td_slope_hzs, td_energy, P, f_axis
+    # return only what's needed by the orchestrator
+    return dets, nb_ratio, tonality, rms, flux, td_slope_hzs, td_energy
 
 # =======================================================================================
 #                           Streaming orchestrator
@@ -655,6 +598,7 @@ def run_streaming(audio_path: Path,
     chk_csv = out_csv.with_suffix(".partial.csv")
     if chk_csv.exists():
         chk_csv.unlink()
+    wrote_header = False
 
     all_dets = []            # global dets [start_s, end_s]
     all_feat_rows = []       # feature rows for GMM export
@@ -663,7 +607,6 @@ def run_streaming(audio_path: Path,
     chunk_idx = 0
     while start_frame < n_frames_total:
         end_frame = min(n_frames_total, start_frame + chunk_frames)
-        read_frames = end_frame - start_frame
 
         # compute padded read window
         pad_left  = overlap_frames
@@ -672,23 +615,21 @@ def run_streaming(audio_path: Path,
         read_end   = min(n_frames_total, end_frame + pad_right)
 
         x, _fs = sf.read(str(audio_path),
-                        start=read_start,
-                        frames=read_end - read_start,
-                        dtype="float32")
+                         start=read_start,
+                         frames=read_end - read_start,
+                         dtype="float32")
         if x.ndim > 1:
             x = x.mean(axis=1)
 
         # detect on the PADDED chunk
-        dets_local, z, nb_ratio, tonality, rms, flux, td_slope_hzs, td_energy, P, f_axis = detect_on_chunk(x, fs)
+        dets_local, nb_ratio, tonality, rms, flux, td_slope_hzs, td_energy = detect_on_chunk(x, fs, chunk_s)
 
         # map local → global using padded t0
         t0_padded = read_start / fs
         dets_global = [[t0_padded + st, t0_padded + en] for (st, en) in dets_local]
 
-        edge_keep_s = overlap_s / 2.0   # <- use this below
-
-
         # keep only the CENTER ownership region of this chunk
+        edge_keep_s = overlap_s / 2.0
         center_left  = (start_frame / fs) + (edge_keep_s if start_frame > 0 else 0.0)
         center_right = (end_frame   / fs) - (edge_keep_s if end_frame   < n_frames_total else 0.0)
 
@@ -699,12 +640,11 @@ def run_streaming(audio_path: Path,
                 kept.append([st, en])
         all_dets.extend(kept)
 
-
-        pd.DataFrame([[st, en] for st, en in kept], columns=["start_s","end_s"])\
-        .to_csv(chk_csv, mode="a", header=not chk_csv.exists(), index=False)
+        df_kept = pd.DataFrame(kept, columns=["start_s","end_s"])
+        df_kept.to_csv(chk_csv, mode="a", header=not wrote_header, index=False)
+        wrote_header = True
 
         # --- per-event features (computed in chunk time then shifted) ---
-        # We compute indices in chunk frame grid for features
         for st_g, en_g in kept:
             st = st_g - t0_padded; en = en_g - t0_padded  # back to chunk sec
             s = int(round(st / HOP_S)); e = max(s+1, int(round(en / HOP_S)))
@@ -722,10 +662,9 @@ def run_streaming(audio_path: Path,
             all_feat_rows.append(row)
 
         chunk_idx += 1
-        start_frame += stride_frames
+        start_frame += (chunk_frames - overlap_frames)
         print(f"Chunk {chunk_idx:04d}: kept {len(kept)} dets (global so far: {len(all_dets)})")
         _progress(chunk_idx, start_frame, n_frames_total, fs, len(all_dets))
-
 
     print(f"Pre-merge dets: {len(all_dets)}")
 
@@ -738,8 +677,7 @@ def run_streaming(audio_path: Path,
         for q in (5, 10, 25, 50, 75, 90, 95):
             print(f"gap p{q}: {np.percentile(gaps, q):.3f} s")
 
-
-    # --- smarter merge: only overlaps or ≤ one hop apart ---
+    # --- merge: only overlaps or ≤ one hop apart ---
     all_dets.sort(key=lambda p: p[0])
     merged = []
     for st, en in all_dets:
@@ -751,7 +689,6 @@ def run_streaming(audio_path: Path,
                 merged[-1][1] = max(men, en)
                 continue
         merged.append([st, en])
-
 
     # Save detections
     pd.DataFrame(merged, columns=["start_s","end_s"]).to_csv(out_csv, index=False)
@@ -794,7 +731,6 @@ def run_streaming(audio_path: Path,
         print(f"GT n={len(gt)} | Det n={len(merged)}")
         print(f"TP={tp}  FP={fp}  FN={fn} | Precision={p:.3f}  Recall={r:.3f}  F1={f1:.3f}")
 
-
 # ------------------- run -------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Streaming CPD")
@@ -810,5 +746,3 @@ if __name__ == "__main__":
 
     run_streaming(AUDIO_PATH, LABELS_PATH, OUT_DETS_CSV,
                   chunk_s=args.chunk_s, overlap_s=args.overlap_s)
-    
-    # run_streaming(AUDIO_PATH, LABELS_PATH, OUT_DETS_CSV, CHUNK_S, OVERLAP_S)
