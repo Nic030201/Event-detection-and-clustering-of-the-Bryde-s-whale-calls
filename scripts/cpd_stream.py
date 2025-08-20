@@ -533,7 +533,7 @@ def detect_on_chunk(x_chunk, fs):
     k = max(1, int(round(SMOOTH_S / HOP_S)))
 
     # entropy-based tonality in mid band (ST/MT focus)
-    ENT_BAND = (70.0, 180.0)  # or (70,160) if ST is your priority
+    ENT_BAND = (70.0, 160.0)  # or (70,160) if ST is your priority
     ent_mid  = band_entropy_tonality(P, f_axis, ENT_BAND)
     z_ent    = rz_ent(median_filter(ent_mid, size=k))
 
@@ -619,8 +619,8 @@ def detect_on_chunk(x_chunk, fs):
         ent_med = float(np.median(z_ent[s:e]))
         nb_med  = float(np.median(z_nb[s:e]))  # note: z_nb is the z-scored nb_ratio
 
-        keep_main = (z_med > (Z_THRESH - 0.05)) and (z_p75 > 0.85*Z_THRESH)
-        keep_rescue = (ent_med > 0.45) and (nb_med > 0.15) and ((en - st) >= 0.18)
+        keep_main = (z_med > (Z_THRESH - 0.1)) and (z_p75 > 0.8*Z_THRESH)
+        keep_rescue = (ent_med > 0.38) and (nb_med > 0.08) and ((en - st) >= 0.16)
 
         if keep_main or keep_rescue:
             accepted.append([st, en])
