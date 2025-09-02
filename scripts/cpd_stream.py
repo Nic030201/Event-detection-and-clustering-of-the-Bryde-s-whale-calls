@@ -1,21 +1,21 @@
-# CPD_streaming.py (clean)
-# Streaming (chunked) runner for your Bryde's CPD detector on very long audio (e.g., 72h).
-# Same features/CPD/splitters as your latest script, but tidied and de-duped.
+# CPD_streaming.py 
+# Streaming runner for your Bryde's CPD detector on very long audio.
 
 import numpy as np
 import pandas as pd
 import soundfile as sf
 from pathlib import Path
-from scipy.signal import butter, filtfilt, get_window, stft, find_peaks
+from scipy.signal import butter, filtfilt, get_window, stft, find_peaks, spectrogram
 from scipy.ndimage import median_filter
 import ruptures as rpt
 import time
 import argparse
+import matplotlib.pyplot as plt
 
 # --- Directories (based on your tree) ---
 PROJ_ROOT   = Path(__file__).resolve().parents[1]
 DATA_DIR    = PROJ_ROOT / "data" / "chunks"   # where your WAV + label files live
-OUT_DIR     = PROJ_ROOT / "results"           # all detections/outputs
+OUT_DIR     = PROJ_ROOT / "results" / "CPD"         # all detections/outputs
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 def resolve_file(name_or_path: str | Path, base: Path) -> Path:
@@ -48,15 +48,16 @@ def add_common_args(parser: argparse.ArgumentParser):
     parser.add_argument("--labels", default=None,
                         help="Label file (filename in same folder or full path).")
     parser.add_argument("--out",    default=None,
-                        help="Output CSV path (defaults to results/<audio_stem>_output.csv).")
+                        help="Output CSV path (defaults to results/CPD/<audio_stem>_output.csv).")
 
 # ------------------- front-end filtering & framing -------------------
-LOW_HZ, HIGH_HZ = 35, 300           # passband
+LOW_HZ, HIGH_HZ = 35, 200      
 FRAME_S = 0.050
 HOP_S   = 0.010
 
 # ------------------- post-proc durations -------------------
 MIN_EVENT_S = 0.20
+DUR_MAX_MAIN = 0.90  # soft upper cap for main (non-burst) events
 MIN_GAP_S   = 0.03
 ONSET_TOL_S = 0.25
 
@@ -457,6 +458,274 @@ def local_cpd_refine(
     return out
 
 
+
+
+# =======================================================================================
+# ------------------------ CPD EVALUATION HELPERS ------------------------
+# =======================================================================================
+def _interval_iou(a, b):
+    """IoU of two [start, end] intervals in seconds."""
+    s1, e1 = a
+    s2, e2 = b
+    inter = max(0.0, min(e1, e2) - max(s1, s2))
+    union = max(e1, e2) - min(s1, s2)
+    return inter / union if union > 0 else 0.0
+
+def match_events(
+    dets, truths, tol_s=0.5, use_iou=False, iou_min=0.3
+):
+    """
+    dets, truths: list of (start_s, end_s)
+    Returns:
+      matches: list of (i_det, i_truth)
+      fp_idx: indices of dets with no match
+      fn_idx: indices of truths with no match
+    """
+    dets = list(dets); truths = list(truths)
+    nD, nT = len(dets), len(truths)
+    matched_det = np.zeros(nD, dtype=bool)
+    matched_tru = np.zeros(nT, dtype=bool)
+    matches = []
+
+    for i_t, (ts, te) in enumerate(truths):
+        best_j, best_score = -1, -1.0
+        for j_d, (ds, de) in enumerate(dets):
+            if matched_det[j_d]:
+                continue
+            if use_iou:
+                score = _interval_iou((ds, de), (ts, te))
+                ok = score >= iou_min
+            else:
+                # onset/offset tolerance match: any overlap after padding
+                ok = (ds <= te + tol_s) and (de >= ts - tol_s)
+                score = 1.0 if ok else -1.0
+            if ok and score > best_score:
+                best_score = score
+                best_j = j_d
+        if best_j >= 0:
+            matched_det[best_j] = True
+            matched_tru[i_t]  = True
+            matches.append((best_j, i_t))
+
+    fp_idx = np.where(~matched_det)[0].tolist()
+    fn_idx = np.where(~matched_tru)[0].tolist()
+    return matches, fp_idx, fn_idx
+
+def compute_cpd_metrics(
+    dets, truths, audio_dur_s, tol_s=0.5, use_iou=False, iou_min=0.3
+):
+    """
+    Returns dict with: precision, recall, f1, fp_per_hour, tpr, arrays of onset/offset/duration errors.
+    """
+    matches, fp_idx, fn_idx = match_events(dets, truths, tol_s, use_iou, iou_min)
+    tp = len(matches); fp = len(fp_idx); fn = len(fn_idx)
+    precision = tp / (tp + fp) if tp + fp > 0 else 0.0
+    recall    = tp / (tp + fn) if tp + fn > 0 else 0.0
+    f1        = (2*precision*recall / (precision+recall)) if (precision+recall)>0 else 0.0
+    fp_per_hour = fp / max(audio_dur_s/3600.0, 1e-9)
+    tpr = recall
+
+    # error arrays for TPs
+    onset_errs, offset_errs, dur_errs = [], [], []
+    for j_d, i_t in matches:
+        ds, de = dets[j_d]
+        ts, te = truths[i_t]
+        onset_errs.append(ds - ts)
+        offset_errs.append(de - te)
+        dur_errs.append((de - ds) - (te - ts))
+
+    return dict(
+        precision=precision, recall=recall, f1=f1, fp_per_hour=fp_per_hour, tpr=tpr,
+        tp=tp, fp=fp, fn=fn,
+        onset_errs=np.array(onset_errs, float),
+        offset_errs=np.array(offset_errs, float),
+        dur_errs=np.array(dur_errs, float),
+        matches=matches, fp_idx=fp_idx, fn_idx=fn_idx
+    )
+
+def pr_curve_from_scores(
+    det_events,   # list of dicts with {'start','end','score'} at minimum
+    truths, audio_dur_s,
+    score_name='score',  # e.g. 'z_p75'
+    thresholds=np.linspace(-1.0, 4.0, 51),  # adjust range to your score stats
+    tol_s=0.5, use_iou=False, iou_min=0.3
+):
+    pr_points = []
+    for th in thresholds:
+        dets = [(d['start'], d['end']) for d in det_events if d.get(score_name, 0.0) >= th]
+        m = compute_cpd_metrics(dets, truths, audio_dur_s, tol_s, use_iou, iou_min)
+        pr_points.append((m['precision'], m['recall'], th))
+    P = [p for p, r, t in pr_points]
+    R = [r for p, r, t in pr_points]
+    return np.array(P), np.array(R), thresholds
+
+
+def plot_z_overlay(t0, window_s, t_z, z, z_thresh, dets, truths, out_png):
+    t1 = t0 + window_s
+    sel = (t_z >= t0) & (t_z <= t1)
+    plt.figure(figsize=(10, 3))
+    plt.plot(t_z[sel], z[sel], lw=1)
+    plt.axhline(z_thresh, ls='--', lw=1, label='Z_THRESH')
+    # detections
+    for (ds, de) in dets:
+        if de < t0 or ds > t1: 
+            continue
+        xs = [max(ds, t0), min(de, t1)]
+        plt.axvspan(xs[0], xs[1], color='tab:green', alpha=0.2)
+    # truths
+    for (ts, te) in truths:
+        if te < t0 or ts > t1:
+            continue
+        xs = [max(ts, t0), min(te, t1)]
+        plt.axvspan(xs[0], xs[1], color='tab:red', alpha=0.2)
+    plt.xlim(t0, t1)
+    plt.xlabel('Time (s)'); plt.ylabel('z-stat')
+    plt.title(f'z overlay [{t0:.1f}–{t1:.1f}s]')
+    plt.tight_layout()
+    plt.legend()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+
+def plot_onset_hist(onset_errs, out_png, bin_s=0.1, range_s=(-1.0, 1.0)):
+    if onset_errs.size == 0:
+        return
+    bins = int((range_s[1]-range_s[0]) / bin_s)
+    plt.figure(figsize=(5,3))
+    plt.hist(onset_errs, bins=bins, range=range_s, edgecolor='k')
+    mu = np.mean(onset_errs); med = np.median(onset_errs)
+    plt.axvline(mu, color='tab:orange', ls='--', label=f'mean={mu*1000:.0f} ms')
+    plt.axvline(med, color='tab:green', ls='--', label=f'median={med*1000:.0f} ms')
+    plt.xlabel('Onset error (s)'); plt.ylabel('Count')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+
+def save_spectro_thumb(
+    wav_path, center_s, out_png,
+    win_s=None,
+    fs_expected=None,
+    fmax=150,
+    nperseg=2048,
+    noverlap_frac=0.93,
+    cmap="magma"
+):
+    y, fs = sf.read(wav_path)
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+    if fs_expected and fs != fs_expected:
+        pass
+
+    # --- adaptive window length ---
+    if win_s is None:
+        win_s = 2.0
+
+    n = len(y)
+    t0 = max(0.0, center_s - win_s/2)
+    t1 = min(n/fs, center_s + win_s/2)
+    i0 = int(t0*fs); i1 = int(t1*fs)
+    if i1 <= i0:
+        # degenerate slice
+        i1 = min(n, i0 + int(1.0*fs))
+    seg = y[i0:i1]
+
+    # too short for a meaningful STFT
+    if len(seg) < 256:
+        plt.figure(figsize=(5.2, 3.6), dpi=160)
+        plt.text(0.5, 0.5, "clip too short", ha="center", va="center")
+        plt.axis('off')
+        plt.savefig(out_png, dpi=200); plt.close()
+        return
+
+    # STFT params, clamped to segment
+    nperseg = min(1024, len(seg))
+    nperseg = max(256, nperseg)
+    noverlap = int(min(nperseg - 1, max(0, noverlap_frac * nperseg)))
+
+    # compute spectrogram
+    f, t, Sxx = spectrogram(seg, fs=fs, nperseg=nperseg, noverlap=noverlap, detrend=False)
+    if Sxx.size == 0:
+        plt.figure(figsize=(5.2, 3.6), dpi=160)
+        plt.text(0.5, 0.5, "no data", ha="center", va="center")
+        plt.axis('off')
+        plt.savefig(out_png, dpi=200); plt.close()
+        return
+
+    # band limit
+    fmax_eff = min(fmax, fs/2.0)
+    keep = f <= fmax_eff
+    if not np.any(keep):
+        keep = slice(None)
+    f, Sxx = f[keep], Sxx[keep, :]
+
+    # log power & contrast
+    Sxx_db = 10*np.log10(Sxx + 1e-12)
+    # robust percentiles for color scale
+    v_hi = np.percentile(Sxx_db, 99)
+    v_lo = np.percentile(Sxx_db, 5)
+    if not np.isfinite(v_lo) or not np.isfinite(v_hi) or v_hi <= v_lo:
+        v_hi = np.nanmax(Sxx_db)
+        v_lo = v_hi - 40.0  # fallback 40 dB window
+    # light per-row whitening
+    Sxx_db = Sxx_db - np.median(Sxx_db, axis=1, keepdims=True)
+
+    plt.figure(figsize=(5.2, 3.6), dpi=160)
+    plt.pcolormesh(t+t0, f, Sxx_db, shading="auto", cmap=cmap, vmin=v_lo, vmax=v_hi)
+    plt.ylim(0, fmax_eff)
+    plt.xlabel("Time (s)"); plt.ylabel("Freq (Hz)")
+    plt.title(f"t={t0:.1f}–{t1:.1f}s")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    plt.close()
+
+def make_error_gallery(
+    wav_path, dets, truths, matches, fp_idx, fn_idx, out_dir, max_each=10
+):
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    # FPs: dets with no match
+    for k, j in enumerate(fp_idx[:max_each]):
+        ds, de = dets[j]
+        dur = de - ds   # or te - ts for FN
+        win_s = max(1.0, min(2.0, dur + 0.5))
+        save_spectro_thumb(wav_path, (ds+de)/2, out_dir/f'FP_{k:02d}_t{ds:.2f}-{de:.2f}.png', win_s=win_s
+)
+    # FNs: truths with no match
+    for k, i in enumerate(fn_idx[:max_each]):
+        ts, te = truths[i]
+        win_s = max(1.0, min(2.0, (te-ts) + 0.5))
+        save_spectro_thumb(wav_path, (ts+te)/2, out_dir/f'FN_{k:02d}_t{ts:.2f}-{te:.2f}.png', win_s=win_s
+)
+
+def per_type_recall(dets, truths, truth_types, tol_s=0.5, use_iou=False, iou_min=0.3):
+    """truth_types: list of strings aligned with truths."""
+    out = {}
+    if truth_types is None:
+        return out
+    types = sorted(set(truth_types))
+    for ty in types:
+        idx = [i for i, t in enumerate(truth_types) if t == ty]
+        truths_ty = [truths[i] for i in idx]
+        m = compute_cpd_metrics(dets, truths_ty, audio_dur_s=1.0, tol_s=tol_s, use_iou=use_iou, iou_min=iou_min)
+        out[ty] = m['recall']
+    return out
+
+def build_summary_row(run_name, metrics, per_type=None):
+    onset_ms = float(np.mean(metrics['onset_errs']))*1000 if metrics['onset_errs'].size else np.nan
+    row = dict(
+        run=run_name,
+        precision=metrics['precision'],
+        recall=metrics['recall'],
+        f1=metrics['f1'],
+        fp_per_hour=metrics['fp_per_hour'],
+        onset_bias_ms=onset_ms,
+        tp=metrics['tp'], fp=metrics['fp'], fn=metrics['fn']
+    )
+    if per_type:
+        for ty, rec in per_type.items():
+            row[f'recall_{ty}'] = rec
+    return row
+
+
 # =======================================================================================
 #                           Per-chunk detector
 # =======================================================================================
@@ -497,7 +766,7 @@ def detect_on_chunk(x_chunk, fs, chunk_s):
     z_tone = rz_tone(median_filter(tonality, size=k))
 
     # weights tuned for recall on tonal ST/MT
-    W_RMS, W_FLUX, W_NB, W_TONE = 0.15, 0.15, 0.45, 0.25
+    W_RMS, W_FLUX, W_NB, W_TONE = 0.10, 0.05, 0.50, 0.35
     z = (W_RMS*z_rms + W_FLUX*z_flux + W_NB*z_nb + W_TONE*z_tone).astype(np.float32)
 
     # CPD → candidates
@@ -565,6 +834,11 @@ def detect_on_chunk(x_chunk, fs, chunk_s):
         nb_med  = float(np.median(z_nb[s:e]))  # z-scored nb_ratio
         keep_main   = (z_med > (Z_THRESH - 0.1)) and (z_p75 > 0.8*Z_THRESH)
         keep_rescue = (ent_med > 0.38) and (nb_med > 0.08) and ((en - st) >= 0.16)
+        dur = en - st
+        # If it's longer than our main cap and not very narrowband/tonal, drop it.
+        if dur > DUR_MAX_MAIN and not (nb_med > 0.20 and ent_med > 0.35):
+            continue
+
         if keep_main or keep_rescue:
             accepted.append([st, en])
             if (not keep_main) and keep_rescue:
@@ -574,7 +848,7 @@ def detect_on_chunk(x_chunk, fs, chunk_s):
     print(f"Rescued by entropy: {rescue_ct}")
 
     # return only what's needed by the orchestrator
-    return dets, nb_ratio, tonality, rms, flux, td_slope_hzs, td_energy
+    return dets, nb_ratio, tonality, rms, flux, td_slope_hzs, td_energy, times, z
 
 # =======================================================================================
 #                           Streaming orchestrator
@@ -595,10 +869,10 @@ def run_streaming(audio_path: Path,
     stride_frames  = chunk_frames - overlap_frames
     assert stride_frames > 0, "chunk_s must be larger than overlap_s"
 
-    chk_csv = out_csv.with_suffix(".partial.csv")
-    if chk_csv.exists():
-        chk_csv.unlink()
-    wrote_header = False
+    # chk_csv = out_csv.with_suffix(".partial.csv")
+    # if chk_csv.exists():
+    #     chk_csv.unlink()
+    # wrote_header = False
 
     all_dets = []            # global dets [start_s, end_s]
     all_feat_rows = []       # feature rows for GMM export
@@ -622,11 +896,17 @@ def run_streaming(audio_path: Path,
             x = x.mean(axis=1)
 
         # detect on the PADDED chunk
-        dets_local, nb_ratio, tonality, rms, flux, td_slope_hzs, td_energy = detect_on_chunk(x, fs, chunk_s)
+        dets_local, nb_ratio, tonality, rms, flux, td_slope_hzs, td_energy, times_local, z_local = detect_on_chunk(x, fs, chunk_s)
 
         # map local → global using padded t0
         t0_padded = read_start / fs
         dets_global = [[t0_padded + st, t0_padded + en] for (st, en) in dets_local]
+
+        t_z_global = t0_padded + times_local[:len(z_local)]
+
+        # Example: stash one 30 s window around 60 s for the overlay figure
+        if 't_z' not in globals():
+            t_z, z = t_z_global.copy(), z_local.copy()
 
         # keep only the CENTER ownership region of this chunk
         edge_keep_s = overlap_s / 2.0
@@ -641,7 +921,7 @@ def run_streaming(audio_path: Path,
         all_dets.extend(kept)
 
         df_kept = pd.DataFrame(kept, columns=["start_s","end_s"])
-        df_kept.to_csv(chk_csv, mode="a", header=not wrote_header, index=False)
+        # df_kept.to_csv(chk_csv, mode="a", header=not wrote_header, index=False)
         wrote_header = True
 
         # --- per-event features (computed in chunk time then shifted) ---
@@ -711,25 +991,115 @@ def run_streaming(audio_path: Path,
     pd.DataFrame(all_feat_rows).to_csv(feats_csv, index=False)
     print(f"Saved features for GMM: {feats_csv} (n={len(all_feat_rows)})")
 
-    # Optional: coarse eval if labels exist (uses begins, tolerant; no z re-compute)
+    # --- Build ground truth once (if labels exist) ---
+    gt = None
+    truths = []
+    truth_types = None
     if labels_path and Path(labels_path).exists():
         gt = read_raven_table(labels_path, prefer_channel=None, dedupe_tol=1e-3)
-        det_on = np.array([st for st, _ in merged], dtype=np.float32)
-        gt_on  = gt["start_s"].values.astype(np.float32)
-        used_det = np.zeros(len(det_on), bool); used_gt = np.zeros(len(gt_on), bool)
-        tp = 0
-        for i, t in enumerate(gt_on):
-            diffs = np.abs(det_on - t); diffs[used_det] = np.inf
-            j = int(np.argmin(diffs))
-            if diffs[j] <= ONSET_TOL_S:
-                used_det[j] = True; used_gt[i] = True; tp += 1
-        fp = int((~used_det).sum()); fn = int((~used_gt).sum())
-        p = tp/(tp+fp) if (tp+fp) else 0.0
-        r = tp/(tp+fn) if (tp+fn) else 0.0
-        f1 = 2*p*r/(p+r) if (p+r) else 0.0
-        print(f"\n=== Streaming eval (approx) ===")
-        print(f"GT n={len(gt)} | Det n={len(merged)}")
-        print(f"TP={tp}  FP={fp}  FN={fn} | Precision={p:.3f}  Recall={r:.3f}  F1={f1:.3f}")
+        truths = list(gt[['start_s','end_s']].itertuples(index=False, name=None))
+        truth_types = gt['type'].tolist() if 'type' in gt.columns else None
+
+    # --- Unified console eval (uses SAME logic as summary) ---
+    if truths:
+        dets = [tuple(x) for x in merged]
+        m = compute_cpd_metrics(
+            dets, truths, audio_dur_s=float(dur_s),
+            tol_s=ONSET_TOL_S, use_iou=False, iou_min=0.3
+        )
+        print("\n=== CPD eval (unified) ===")
+        print(f"GT n={len(truths)} | Det n={len(dets)}")
+        print(f"TP={m['tp']}  FP={m['fp']}  FN={m['fn']} | "
+              f"Precision={m['precision']:.3f}  Recall={m['recall']:.3f}  F1={m['f1']:.3f}  "
+              f"FP/h={m['fp_per_hour']:.2f}")
+    else:
+        print("[cpd_eval] No labels provided; metrics skipped.")
+
+        
+    # ------------------------ CPD EVALUATION CALLS ------------------------
+    # Build detection & truth lists from what's computed above.
+    dets = [tuple(x) for x in merged]           # list[(start_s, end_s)]
+    audio_dur_s = float(dur_s)
+
+    # If no truths, skip metrics (nothing to compare against)
+    if truths:
+        # --- Core metrics (FP/h, TPR/Recall, Onset/Offset error, Duration bias) ---
+        tol_s = ONSET_TOL_S  # use your configured onset tolerance
+        metrics = compute_cpd_metrics(dets, truths, audio_dur_s,
+                                      tol_s=tol_s, use_iou=False, iou_min=0.3)
+
+        # --- Per-type recall (optional) ---
+        ptype = per_type_recall(dets, truths, truth_types, tol_s=tol_s) if truth_types else {}
+
+        # --- Summary table ---
+        outdir = Path("results/cpd_eval"); outdir.mkdir(parents=True, exist_ok=True)
+        summary_row = build_summary_row("cpd_current", metrics, per_type=ptype)
+        pd.DataFrame([summary_row]).to_csv(outdir / "summary.csv", index=False)
+        print(f"[cpd_eval] Saved summary → {outdir/'summary.csv'}")
+
+        # --- PR curve (score sweep) ---
+        # Use an event-level "score". You already collect per-event features in all_feat_rows.
+        # Pick a monotonic-with-confidence proxy like nb_ratio_p75 (or tonality_med).
+        det_event_dicts = []
+        for r in all_feat_rows:
+            sc = r.get('nb_ratio_p75', None)
+            if sc is None:
+                sc = r.get('tonality_med', 0.0)
+            det_event_dicts.append({'start': r['start_s'], 'end': r['end_s'], 'score': float(sc)})
+
+        try:
+            scores = np.array([d['score'] for d in det_event_dicts], float)
+            if scores.size >= 5 and np.isfinite(scores).all():
+                lo, hi = np.percentile(scores, [1, 99])
+                if not np.isfinite(lo): lo = np.nanmin(scores)
+                if not np.isfinite(hi): hi = np.nanmax(scores)
+                if hi <= lo: hi = lo + 1e-3
+                P, R, TH = pr_curve_from_scores(
+                    det_event_dicts, truths, audio_dur_s,
+                    score_name='score',
+                    thresholds=np.linspace(lo, hi, 41),
+                    tol_s=tol_s, use_iou=False, iou_min=0.3
+                )
+                plt.figure(figsize=(4,4))
+                plt.plot(R, P, marker='o', lw=1)
+                plt.xlabel('Recall'); plt.ylabel('Precision'); plt.title('CPD PR (score sweep)')
+                plt.grid(True, ls='--', alpha=0.4)
+                plt.tight_layout(); plt.savefig(outdir / "cpd_pr_curve.png", dpi=160); plt.close()
+                print(f"[cpd_eval] Saved PR curve → {outdir/'cpd_pr_curve.png'}")
+            else:
+                print("[cpd_eval][warn] PR curve skipped: insufficient or invalid scores.")
+        except Exception as e:
+            print("[cpd_eval][warn] PR curve failed:", e)
+
+        # --- Onset error histogram ---
+        plot_onset_hist(metrics['onset_errs'], outdir/"onset_error_hist.png",
+                        bin_s=0.05, range_s=(-1.0, 1.0))
+        print(f"[cpd_eval] Saved onset error histogram → {outdir/'onset_error_hist.png'}")
+
+        # --- Error gallery (FP/FN spectrograms) ---
+        make_error_gallery(audio_path, dets, truths, metrics['matches'],
+                           metrics['fp_idx'], metrics['fn_idx'],
+                           out_dir=outdir/"error_gallery", max_each=12)
+        print(f"[cpd_eval] Saved error gallery → {outdir/'error_gallery'}")
+
+        # --- z-signal overlay (optional) ---
+        # NOTE: You currently don't expose t_z and z. If you want this plot,
+        # return (times, z) from detect_on_chunk and stitch to global time:
+        #   1) In detect_on_chunk(...): return `times` and `z` too.
+        #   2) In the loop, after t0_padded is known, do:
+        #        t_z_global = t0_padded + times[:len(z)]
+        #        collect a slice that covers t0..t0+window.
+        # For now, we skip unless you wire those arrays.
+        if 't_z' in globals() and 'z' in globals():
+            plot_z_overlay(t0=60.0, window_s=30.0, t_z=t_z, z=z, z_thresh=Z_THRESH,
+                           dets=dets, truths=truths, out_png=outdir/"z_overlay_60s.png")
+            print(f"[cpd_eval] Saved z overlay → {outdir/'z_overlay_60s.png'}")
+        else:
+            print("[cpd_eval][info] z overlay skipped (t_z/z not provided).")
+    else:
+        print("[cpd_eval] No labels provided; metrics skipped.")
+
+
 
 # ------------------- run -------------------
 if __name__ == "__main__":
