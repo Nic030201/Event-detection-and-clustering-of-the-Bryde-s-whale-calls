@@ -5,12 +5,18 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 from pathlib import Path
-from scipy.signal import butter, filtfilt, get_window, stft, find_peaks, spectrogram
+from scipy.signal import butter, filtfilt, get_window, stft, find_peaks, spectrogram, resample_poly
 from scipy.ndimage import median_filter
 import ruptures as rpt
 import time
 import argparse
 import matplotlib.pyplot as plt
+from scipy.signal.windows import dpss
+import math
+from matplotlib.colors import PowerNorm, Normalize
+
+
+
 
 # --- Directories (based on your tree) ---
 PROJ_ROOT   = Path(__file__).resolve().parents[1]
@@ -601,82 +607,200 @@ def plot_onset_hist(onset_errs, out_png, bin_s=0.1, range_s=(-1.0, 1.0)):
     plt.savefig(out_png, dpi=160)
     plt.close()
 
+
+    
+
 def save_spectro_thumb(
-    wav_path, center_s, out_png,
-    win_s=None,
-    fs_expected=None,
-    fmax=150,
-    nperseg=2048,
-    noverlap_frac=0.93,
-    cmap="magma"
+    wav_path,
+    center_s,
+    out_png,
+    *,
+    mode="report",          # "inspection" (crisp) or "report" (smoother)
+    fmin=20.0,
+    fmax=350.0,
+    crop_s=None,                # None -> 4.0 (inspection) / 5.0 (report)
+    target_fs=2000,             # upper bound after band-aware downsampling
+    dyn_db=70,                  # dynamic range (try 65–75)
+    hi_pct=99.3,                # white point percentile (lower -> brighter mids)
+    lo_pct=15,                  # lower percentile clip (use None to revert to dyn_db)
+    whitening=False,            # subtract per-frequency median (stationary floor)
+    fft_pad=8,                  # frequency zero-padding multiplier (1, 4, 8, 16)
+    time_up=1,                  # cosmetic time upsampling factor (1 or 2)
+    cmap="inferno",             # "inferno"/"magma"/"turbo"/"cividis"
+    gamma=0.75,                 # gamma < 1 boosts mid-tones (0.6–0.85)
+    adaptive_floor=True,        # remove slow time-varying floor
+    floor_seconds=0.5,          # baseline window along time (s) if adaptive_floor
+    figsize=(9.6, 3.4),
+    dpi=340,
+    # NEW: simple overlays (vertical lines only)
+    truth_spans=None,           # list of (start_s, end_s) -> solid black lines
+    det_spans=None,             # list of (start_s, end_s) -> dashed black lines
+    truth_lw=2.2,
+    det_lw=1.6,
 ):
-    y, fs = sf.read(wav_path)
+    """
+    Save a clear, band-limited spectrogram thumbnail around `center_s` (sec).
+    Works well for Bryde’s whale thumbnails in 20–350 Hz.
+    Draws optional vertical lines at truth/detection spans.
+    """
+
+
+    truth_spans = truth_spans or []
+    det_spans   = det_spans or []
+
+    # --- Load mono
+    y, fs = sf.read(str(wav_path))
     if y.ndim > 1:
         y = y.mean(axis=1)
-    if fs_expected and fs != fs_expected:
-        pass
+    y = y.astype(np.float32)
 
-    # --- adaptive window length ---
-    if win_s is None:
-        win_s = 2.0
+    # --- Crop (reflect-pad at edges)
+    if crop_s is None:
+        crop_s = 4.0 if mode == "inspection" else 5.0
+    crop_s = max(3.0, float(crop_s))
 
-    n = len(y)
-    t0 = max(0.0, center_s - win_s/2)
-    t1 = min(n/fs, center_s + win_s/2)
-    i0 = int(t0*fs); i1 = int(t1*fs)
-    if i1 <= i0:
-        # degenerate slice
-        i1 = min(n, i0 + int(1.0*fs))
-    seg = y[i0:i1]
+    t_total = len(y) / fs
+    t0 = max(0.0, center_s - crop_s / 2)
+    t1 = min(t_total, center_s + crop_s / 2)
 
-    # too short for a meaningful STFT
-    if len(seg) < 256:
-        plt.figure(figsize=(5.2, 3.6), dpi=160)
-        plt.text(0.5, 0.5, "clip too short", ha="center", va="center")
-        plt.axis('off')
-        plt.savefig(out_png, dpi=200); plt.close()
-        return
+    pad_left = max(0, int(np.ceil((crop_s / 2 - center_s) * fs)))
+    pad_right = max(0, int(np.ceil((center_s + crop_s / 2 - t_total) * fs)))
+    if pad_left or pad_right:
+        y = np.pad(y, (pad_left, pad_right), mode="reflect")
+        t0 += pad_left / fs
+        t1 += pad_left / fs
 
-    # STFT params, clamped to segment
-    nperseg = min(1024, len(seg))
-    nperseg = max(256, nperseg)
-    noverlap = int(min(nperseg - 1, max(0, noverlap_frac * nperseg)))
+    seg = y[int(round(t0 * fs)): int(round(t1 * fs))]
+    seg_dur = len(seg) / fs
 
-    # compute spectrogram
-    f, t, Sxx = spectrogram(seg, fs=fs, nperseg=nperseg, noverlap=noverlap, detrend=False)
-    if Sxx.size == 0:
-        plt.figure(figsize=(5.2, 3.6), dpi=160)
+    # --- Band-aware downsample (enough for fmax, not wasteful)
+    fs_goal = int(min(target_fs, max(1200, 6 * int(fmax))))
+    if fs > fs_goal:
+        g = math.gcd(int(fs), int(fs_goal))
+        up, down = fs_goal // g, fs // g
+        seg = resample_poly(seg, up, down)
+        fs = fs_goal
+
+    # --- Optional time upsampling (cosmetic smoothing of columns)
+    if time_up > 1:
+        seg = resample_poly(seg, time_up, 1)
+        fs *= time_up
+
+    # --- STFT params
+    if mode == "inspection":
+        win_s = 0.240     # ~4–5 Hz resolution at fs~2 kHz
+        hop_s = 0.012     # ~95% overlap -> many time bins
+        smooth = (1, 1)   # no extra smoothing
+        interp = "nearest"
+    else:  # "report"
+        win_s = 0.264
+        hop_s = 0.010
+        smooth = (1, 3)   # light time smoothing
+        interp = "bilinear"
+
+    nper = max(256, int(round(win_s * fs)))
+    nover = max(0, int(round((win_s - hop_s) * fs)))
+    # FFT zero-padding (frequency interpolation)
+    pad_mult = max(1, int(fft_pad))
+    base = max(nper * pad_mult, 512)
+    nfft = 1 << int(np.ceil(np.log2(base)))
+
+    # --- Spectrogram (with fallback for older SciPy)
+    try:
+        f, t, S = spectrogram(
+            seg, fs=fs, window="hann",
+            nperseg=nper, noverlap=nover, nfft=nfft,
+            detrend=False, scaling="density", mode="psd",
+            boundary="zeros", padded=True
+        )
+    except TypeError:
+        f, t, S = spectrogram(
+            seg, fs=fs, window="hann",
+            nperseg=nper, noverlap=nover, nfft=nfft,
+            detrend=False, scaling="density", mode="psd"
+        )
+    if S.size == 0:
+        plt.figure(figsize=figsize, dpi=dpi)
         plt.text(0.5, 0.5, "no data", ha="center", va="center")
-        plt.axis('off')
-        plt.savefig(out_png, dpi=200); plt.close()
+        plt.axis("off")
+        Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_png, dpi=dpi, bbox_inches="tight")
+        plt.close()
         return
 
-    # band limit
-    fmax_eff = min(fmax, fs/2.0)
-    keep = f <= fmax_eff
+    # --- Band limit
+    keep = (f >= fmin) & (f <= min(fmax, fs / 2))
     if not np.any(keep):
         keep = slice(None)
-    f, Sxx = f[keep], Sxx[keep, :]
+    f = f[keep]
+    S = S[keep, :]
 
-    # log power & contrast
-    Sxx_db = 10*np.log10(Sxx + 1e-12)
-    # robust percentiles for color scale
-    v_hi = np.percentile(Sxx_db, 99)
-    v_lo = np.percentile(Sxx_db, 5)
+    # --- Convert to dB
+    eps = 1e-12
+    Sdb = 10.0 * np.log10(S + eps)
+
+    # Optional per-frequency whitening (remove stationary floor)
+    if whitening:
+        Sdb = Sdb - np.median(Sdb, axis=1, keepdims=True)
+
+    # Optional adaptive floor removal along time (drifting backgrounds)
+    if adaptive_floor:
+        win_cols = max(9, int(round(floor_seconds / max(hop_s, 1e-6))))
+        baseline = median_filter(Sdb, size=(1, win_cols))
+        Sdb = Sdb - baseline
+
+    # Optional light smoothing for the "report" mode
+    if smooth != (1, 1):
+        Sdb = median_filter(Sdb, size=smooth)
+
+    # --- Robust contrast
+    v_hi = np.percentile(Sdb, hi_pct)
+    if lo_pct is None:
+        v_lo = v_hi - float(dyn_db)
+    else:
+        v_lo = np.percentile(Sdb, lo_pct)
+
     if not np.isfinite(v_lo) or not np.isfinite(v_hi) or v_hi <= v_lo:
-        v_hi = np.nanmax(Sxx_db)
-        v_lo = v_hi - 40.0  # fallback 40 dB window
-    # light per-row whitening
-    Sxx_db = Sxx_db - np.median(Sxx_db, axis=1, keepdims=True)
+        v_lo = np.nanpercentile(Sdb, 20.0)
+        v_hi = np.nanpercentile(Sdb, 99.7)
 
-    plt.figure(figsize=(5.2, 3.6), dpi=160)
-    plt.pcolormesh(t+t0, f, Sxx_db, shading="auto", cmap=cmap, vmin=v_lo, vmax=v_hi)
-    plt.ylim(0, fmax_eff)
-    plt.xlabel("Time (s)"); plt.ylabel("Freq (Hz)")
-    plt.title(f"t={t0:.1f}–{t1:.1f}s")
+    # Gamma mapping (mid-tone boost) and draw
+    norm = PowerNorm(gamma=gamma, vmin=v_lo, vmax=v_hi, clip=True) if gamma else \
+           Normalize(vmin=v_lo, vmax=v_hi, clip=True)
+
+    extent = [t0, t0 + seg_dur, float(f[0]), float(f[-1])]
+
+    plt.figure(figsize=figsize, dpi=dpi)
+    plt.imshow(
+        Sdb, origin="lower", aspect="auto",
+        extent=extent, cmap=cmap, norm=norm, interpolation=interp
+    )
+    plt.xlim(extent[0], extent[1])
+    plt.ylim(fmin, min(fmax, fs / 2))
+    plt.xlabel("Time (s)")
+    plt.ylabel("Freq (Hz)")
+    plt.grid(alpha=0.2, linewidth=0.5)
+
+    # ---- overlays: simple vertical lines only (black)
+    ax = plt.gca()
+    ymin, ymax = fmin, min(fmax, fs / 2)
+
+    def _vlines(spans, lw=2.0, ls="-"):
+        for s, e in spans:
+            ax.vlines([s, e], ymin=ymin, ymax=ymax,
+                      colors="w", linewidth=lw, linestyles=ls, zorder=5)
+
+    if truth_spans:
+        _vlines(truth_spans, lw=truth_lw, ls="--")   # solid black
+    if det_spans:
+        _vlines(det_spans,   lw=det_lw,   ls="--")  # dashed black
+
     plt.tight_layout()
-    plt.savefig(out_png, dpi=200)
+    Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=dpi, bbox_inches="tight")
     plt.close()
+
+
 
 def make_error_gallery(
     wav_path, dets, truths, matches, fp_idx, fn_idx, out_dir, max_each=10
@@ -687,13 +811,13 @@ def make_error_gallery(
         ds, de = dets[j]
         dur = de - ds   # or te - ts for FN
         win_s = max(1.0, min(2.0, dur + 0.5))
-        save_spectro_thumb(wav_path, (ds+de)/2, out_dir/f'FP_{k:02d}_t{ds:.2f}-{de:.2f}.png', win_s=win_s
+        save_spectro_thumb(wav_path, (ds+de)/2, out_dir/f'FP_{k:02d}_t{ds:.2f}-{de:.2f}.png', crop_s=win_s, mode="inspection",det_spans=[(ds, de)]
 )
     # FNs: truths with no match
     for k, i in enumerate(fn_idx[:max_each]):
         ts, te = truths[i]
         win_s = max(1.0, min(2.0, (te-ts) + 0.5))
-        save_spectro_thumb(wav_path, (ts+te)/2, out_dir/f'FN_{k:02d}_t{ts:.2f}-{te:.2f}.png', win_s=win_s
+        save_spectro_thumb(wav_path, (ts+te)/2, out_dir/f'FN_{k:02d}_t{ts:.2f}-{te:.2f}.png', crop_s=win_s, mode="inspection",truth_spans=[(ts, te)] 
 )
 
 def per_type_recall(dets, truths, truth_types, tol_s=0.5, use_iou=False, iou_min=0.3):
