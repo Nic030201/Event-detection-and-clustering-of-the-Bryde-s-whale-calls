@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 from pathlib import Path
-from scipy.signal import butter, filtfilt, get_window, stft, find_peaks, spectrogram, resample_poly
+from scipy.signal import butter, filtfilt, get_window, stft, find_peaks, spectrogram, resample_poly, sosfiltfilt
 from scipy.ndimage import median_filter
 import ruptures as rpt
 import time
@@ -14,8 +14,7 @@ import matplotlib.pyplot as plt
 from scipy.signal.windows import dpss
 import math
 from matplotlib.colors import PowerNorm, Normalize
-
-
+from matplotlib.ticker import ScalarFormatter
 
 
 # --- Directories (based on your tree) ---
@@ -70,7 +69,7 @@ ONSET_TOL_S = 0.25
 # ------------------- CPD preset (recall tilt) -------------------
 MODEL    = "l2"
 PENALTY  = 40.0
-Z_THRESH = 1.25
+Z_THRESH = 1.2
 SMOOTH_S = 0.70
 
 # ------------------- STFT config for spectral features -------------------
@@ -96,10 +95,36 @@ LOCAL_PEN_RATIO      = 0.70
 LOCAL_MIN_EVENT_S    = 0.25
 LOCAL_MIN_SEP_S      = 0.60
 
+
+# --- plotting/debug toggles ---
+DEBUG_PLOTS  = False                  # per-chunk z-plot
+PLOT_AT_END  = True                  # final stitched plot
+PLOT_SAVEPATH = OUT_DIR / "debug_zstream_full.png"   # was a bare string
+
+# accumulator for plotting across chunks
+plot_accum = {
+    "t": [],       # absolute times
+    "z": [],       # fused z
+    "dets": []     # list of (st_abs, en_abs)
+}
+
 # =======================================================================================
 #                                  Core helpers
 # =======================================================================================
 _t0 = time.time()
+
+def _rolling_mean_std(x: np.ndarray, win: int):
+    """Centered rolling mean/std with 'same' length. Win must be >=1."""
+    if win <= 1 or x.size == 0:
+        return x.astype(np.float32), np.zeros_like(x, dtype=np.float32)
+    w = int(win)
+    ones = np.ones(w, dtype=np.float32)
+    sum1 = np.convolve(x.astype(np.float32), ones, mode="same")
+    sum2 = np.convolve((x*x).astype(np.float32), ones, mode="same")
+    m = sum1 / w
+    v = sum2 / w - m*m
+    v[v < 0.0] = 0.0
+    return m, np.sqrt(v + 1e-12)
 
 def _progress(chunk_idx, start_frame, n_frames_total, fs, total_kept):
     done_s   = start_frame / fs
@@ -415,6 +440,14 @@ class RobustZEMA:
         return (x - self.med) / (1.4826*self.mad + self.eps)
 
 rz_rms, rz_flux, rz_nb, rz_tone, rz_ent = RobustZEMA(), RobustZEMA(), RobustZEMA(), RobustZEMA(), RobustZEMA()
+rz_td_energy = RobustZEMA()
+rz_sfm   = RobustZEMA()
+rz_crest = RobustZEMA()
+rz_snr   = RobustZEMA()   # (or rz_ber if you prefer BER)
+
+
+
+
 
 def band_entropy_tonality(P, f_axis, band):
     m = (f_axis >= band[0]) & (f_axis <= band[1])
@@ -615,46 +648,61 @@ def save_spectro_thumb(
     center_s,
     out_png,
     *,
-    mode="report",          # "inspection" (crisp) or "report" (smoother)
+    # core behaviour
+    mode="report",              # "inspection" (crisp) or "report" (smoother)
     fmin=20.0,
     fmax=350.0,
     crop_s=None,                # None -> 4.0 (inspection) / 5.0 (report)
     target_fs=2000,             # upper bound after band-aware downsampling
-    dyn_db=70,                  # dynamic range (try 65–75)
+    dyn_db=40,                  # dynamic range (dB)
     hi_pct=99.3,                # white point percentile (lower -> brighter mids)
-    lo_pct=15,                  # lower percentile clip (use None to revert to dyn_db)
+    lo_pct=15,                  # lower percentile clip (None -> use dyn_db)
     whitening=False,            # subtract per-frequency median (stationary floor)
-    fft_pad=8,                  # frequency zero-padding multiplier (1, 4, 8, 16)
-    time_up=1,                  # cosmetic time upsampling factor (1 or 2)
-    cmap="inferno",             # "inferno"/"magma"/"turbo"/"cividis"
-    gamma=0.75,                 # gamma < 1 boosts mid-tones (0.6–0.85)
     adaptive_floor=True,        # remove slow time-varying floor
     floor_seconds=0.5,          # baseline window along time (s) if adaptive_floor
+    # rendering & cosmetics
+    fft_pad=8,                  # frequency zero-padding multiplier (1, 4, 8, 16)
+    time_up=1,                  # cosmetic time upsampling factor (1 or 2)
+    cmap="jet",                 # "inferno"/"magma"/"turbo"/"cividis"/etc.
+    gamma=0.75,                 # gamma < 1 boosts mid-tones (0.6–0.85)
     figsize=(9.6, 3.4),
     dpi=340,
-    # NEW: simple overlays (vertical lines only)
-    truth_spans=None,           # list of (start_s, end_s) -> solid black lines
-    det_spans=None,             # list of (start_s, end_s) -> dashed black lines
+    grid_alpha=0.2,
+    # overlays
+    truth_spans=None,           # list[(start_s, end_s)] -> dashed white lines
+    det_spans=None,             # list[(start_s, end_s)] -> dashed white lines
     truth_lw=2.2,
     det_lw=1.6,
+    # --- NEW knobs (borrowed / harmonised with your other script) ---
+    relative_time=False,        # start x-axis at 0 for this crop
+    render="imshow",            # "imshow" (fast) or "pcolor" (grid-true)
+    shading="nearest",          # for render="pcolor": "nearest" or "gouraud"
+    nfft_exact=None             # if set (int >= nperseg), overrides fft_pad
 ):
     """
     Save a clear, band-limited spectrogram thumbnail around `center_s` (sec).
-    Works well for Bryde’s whale thumbnails in 20–350 Hz.
-    Draws optional vertical lines at truth/detection spans.
-    """
 
+    Improvements over the earlier version:
+      - relative_time: clean x-axis (0..dur) when True
+      - render="pcolor" with selectable shading ("nearest"/"gouraud")
+      - nfft_exact: explicit FFT length (cosmetic densification of frequency pixels)
+      - keeps band-aware downsampling, whitening, adaptive floor, overlays
+    """
 
     truth_spans = truth_spans or []
     det_spans   = det_spans or []
 
-    # --- Load mono
+    # ----------------------------
+    # Load mono audio
+    # ----------------------------
     y, fs = sf.read(str(wav_path))
     if y.ndim > 1:
         y = y.mean(axis=1)
     y = y.astype(np.float32)
 
-    # --- Crop (reflect-pad at edges)
+    # ----------------------------
+    # Crop around center (reflect-pad near edges)
+    # ----------------------------
     if crop_s is None:
         crop_s = 4.0 if mode == "inspection" else 5.0
     crop_s = max(3.0, float(crop_s))
@@ -673,39 +721,53 @@ def save_spectro_thumb(
     seg = y[int(round(t0 * fs)): int(round(t1 * fs))]
     seg_dur = len(seg) / fs
 
-    # --- Band-aware downsample (enough for fmax, not wasteful)
+    # ----------------------------
+    # Band-aware downsample (enough for fmax; avoid wasted HF)
+    # ----------------------------
     fs_goal = int(min(target_fs, max(1200, 6 * int(fmax))))
     if fs > fs_goal:
+        # anti-alias, then rational resample
+        Wn = min(0.45 * fs_goal / (fs / 2), 0.999)
+        sos = butter(8, Wn, btype="low", output="sos")
+        seg = sosfiltfilt(sos, seg)
         g = math.gcd(int(fs), int(fs_goal))
         up, down = fs_goal // g, fs // g
         seg = resample_poly(seg, up, down)
         fs = fs_goal
 
-    # --- Optional time upsampling (cosmetic smoothing of columns)
+    # Optional cosmetic time upsampling (column smoothing)
     if time_up > 1:
         seg = resample_poly(seg, time_up, 1)
         fs *= time_up
 
-    # --- STFT params
+    # ----------------------------
+    # STFT window/hop from mode
+    # ----------------------------
     if mode == "inspection":
-        win_s = 0.240     # ~4–5 Hz resolution at fs~2 kHz
-        hop_s = 0.012     # ~95% overlap -> many time bins
-        smooth = (1, 1)   # no extra smoothing
-        interp = "nearest"
+        win_s = 0.240     # ~4–5 Hz at fs~2 kHz
+        hop_s = 0.012     # ~95% overlap → many time columns
+        smooth_sz = (1, 1)
+        default_interp = "nearest"
     else:  # "report"
         win_s = 0.264
         hop_s = 0.010
-        smooth = (1, 3)   # light time smoothing
-        interp = "bilinear"
+        smooth_sz = (1, 3)  # light time smoothing
+        default_interp = "bilinear"
 
     nper = max(256, int(round(win_s * fs)))
     nover = max(0, int(round((win_s - hop_s) * fs)))
-    # FFT zero-padding (frequency interpolation)
-    pad_mult = max(1, int(fft_pad))
-    base = max(nper * pad_mult, 512)
-    nfft = 1 << int(np.ceil(np.log2(base)))
 
-    # --- Spectrogram (with fallback for older SciPy)
+    # --- nfft: explicit override or padded pow2 based on fft_pad
+    if nfft_exact is not None and int(nfft_exact) >= nper:
+        nfft = int(nfft_exact)
+    else:
+        pad_mult = max(1, int(fft_pad))
+        base = max(nper * pad_mult, 512)
+        nfft = 1 << int(np.ceil(np.log2(base)))
+
+    # ----------------------------
+    # Spectrogram
+    # ----------------------------
     try:
         f, t, S = spectrogram(
             seg, fs=fs, window="hann",
@@ -719,6 +781,7 @@ def save_spectro_thumb(
             nperseg=nper, noverlap=nover, nfft=nfft,
             detrend=False, scaling="density", mode="psd"
         )
+
     if S.size == 0:
         plt.figure(figsize=figsize, dpi=dpi)
         plt.text(0.5, 0.5, "no data", ha="center", va="center")
@@ -728,32 +791,31 @@ def save_spectro_thumb(
         plt.close()
         return
 
-    # --- Band limit
+    # Band limit
     keep = (f >= fmin) & (f <= min(fmax, fs / 2))
     if not np.any(keep):
         keep = slice(None)
     f = f[keep]
     S = S[keep, :]
 
-    # --- Convert to dB
+    # Convert to dB and optional whitening / adaptive floor
     eps = 1e-12
     Sdb = 10.0 * np.log10(S + eps)
 
-    # Optional per-frequency whitening (remove stationary floor)
     if whitening:
         Sdb = Sdb - np.median(Sdb, axis=1, keepdims=True)
 
-    # Optional adaptive floor removal along time (drifting backgrounds)
     if adaptive_floor:
-        win_cols = max(9, int(round(floor_seconds / max(hop_s, 1e-6))))
+        hop_for_cols = max(hop_s, 1e-6)
+        win_cols = max(9, int(round(floor_seconds / hop_for_cols)))
         baseline = median_filter(Sdb, size=(1, win_cols))
         Sdb = Sdb - baseline
 
-    # Optional light smoothing for the "report" mode
-    if smooth != (1, 1):
-        Sdb = median_filter(Sdb, size=smooth)
+    # Light smoothing for "report"
+    if smooth_sz != (1, 1):
+        Sdb = median_filter(Sdb, size=smooth_sz)
 
-    # --- Robust contrast
+    # Robust contrast from percentiles
     v_hi = np.percentile(Sdb, hi_pct)
     if lo_pct is None:
         v_lo = v_hi - float(dyn_db)
@@ -764,43 +826,75 @@ def save_spectro_thumb(
         v_lo = np.nanpercentile(Sdb, 20.0)
         v_hi = np.nanpercentile(Sdb, 99.7)
 
-    # Gamma mapping (mid-tone boost) and draw
+    # Normalization (gamma or linear)
     norm = PowerNorm(gamma=gamma, vmin=v_lo, vmax=v_hi, clip=True) if gamma else \
            Normalize(vmin=v_lo, vmax=v_hi, clip=True)
 
-    extent = [t0, t0 + seg_dur, float(f[0]), float(f[-1])]
+    # X-axis handling (absolute vs relative)
+    if relative_time:
+        x0, x1 = 0.0, float(t[-1]) + hop_s  # approximate right edge
+        t_plot = t  # already relative to segment start
+    else:
+        x0 = t0 + float(t[0])               # small offset from left edge
+        x1 = t0 + float(t[-1]) + hop_s
+        t_plot = t + t0
 
+    # ----------------------------
+    # Draw
+    # ----------------------------
     plt.figure(figsize=figsize, dpi=dpi)
-    plt.imshow(
-        Sdb, origin="lower", aspect="auto",
-        extent=extent, cmap=cmap, norm=norm, interpolation=interp
-    )
-    plt.xlim(extent[0], extent[1])
+
+    if render.lower() == "pcolor":
+        # Build coordinate grids matched to Sdb dimensions.
+        # pcolormesh accepts X,Y of same shape as Z when using shading="nearest".
+        T, F = np.meshgrid(t_plot, f)
+        h = plt.pcolormesh(T, F, Sdb, shading=shading, cmap=cmap, norm=norm)
+    else:
+        # Fast path: imshow over extent (uses interpolation for cosmetic smoothing)
+        extent = [x0, x1, float(f[0]), float(f[-1])]
+        interp = default_interp  # "nearest" (inspection) or "bilinear" (report)
+        h = plt.imshow(
+            Sdb, origin="lower", aspect="auto",
+            extent=extent, cmap=cmap, norm=norm,
+            interpolation=interp
+        )
+
     plt.ylim(fmin, min(fmax, fs / 2))
+    plt.xlim(t_plot[0] if relative_time else x0, t_plot[-1] if relative_time else x1)
     plt.xlabel("Time (s)")
     plt.ylabel("Freq (Hz)")
-    plt.grid(alpha=0.2, linewidth=0.5)
+    plt.grid(alpha=grid_alpha, linewidth=0.5)
 
-    # ---- overlays: simple vertical lines only (black)
+    # Vertical overlays (white) for truth/detections
     ax = plt.gca()
     ymin, ymax = fmin, min(fmax, fs / 2)
 
-    def _vlines(spans, lw=2.0, ls="-"):
+    def _vlines(spans, lw=2.0, ls="--"):
+        if not spans:
+            return
         for s, e in spans:
+            # spans are absolute seconds; shift if relative_time
+            if relative_time:
+                s -= t0
+                e -= t0
             ax.vlines([s, e], ymin=ymin, ymax=ymax,
                       colors="w", linewidth=lw, linestyles=ls, zorder=5)
 
-    if truth_spans:
-        _vlines(truth_spans, lw=truth_lw, ls="--")   # solid black
-    if det_spans:
-        _vlines(det_spans,   lw=det_lw,   ls="--")  # dashed black
+    _vlines(truth_spans, lw=truth_lw, ls="--")
+    _vlines(det_spans,   lw=det_lw,   ls="--")
+
+    # Clean axis offsets when relative
+    if relative_time:
+        ax.xaxis.set_major_formatter(ScalarFormatter(useOffset=False))
+
+    # Colorbar label
+    cbar = plt.colorbar(h)
+    cbar.set_label("Power (dB)")
 
     plt.tight_layout()
     Path(out_png).parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_png, dpi=dpi, bbox_inches="tight")
     plt.close()
-
-
 
 def make_error_gallery(
     wav_path, dets, truths, matches, fp_idx, fn_idx, out_dir, max_each=10
@@ -850,6 +944,38 @@ def build_summary_row(run_name, metrics, per_type=None):
     return row
 
 
+def plot_z_with_detections(times, z_raw, dets_raw, z_ci=None, dets_ci=None,
+                           title="Detections over multi-feature z", z_thresh=None,
+                           save_path: Path | None = None):
+    plt.figure(figsize=(11, 2.8))
+    plt.plot(times, z_raw, label="z (pre-CI)", linewidth=1.0)
+    if z_ci is not None:
+        plt.plot(times, z_ci, label="z_ci (post-CI)", linewidth=1.0, alpha=0.95)
+    if z_thresh is not None:
+        plt.axhline(z_thresh, color="gray", ls="--", lw=0.8, label="Z_THRESH")
+
+    # raw detections
+    for (st, en) in (dets_raw or []):
+        plt.axvspan(st, en, color="orange", alpha=0.18, label=None)
+    # CI detections (draw on top)
+    for (st, en) in (dets_ci or []):
+        plt.axvspan(st, en, color="red", alpha=0.18, label=None)
+
+    plt.title(title)
+    plt.xlabel("Time (s)")
+    plt.ylabel("z-score")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=160)
+        plt.close()
+    else:
+        plt.show()
+
+
+
 # =======================================================================================
 #                           Per-chunk detector
 # =======================================================================================
@@ -873,6 +999,33 @@ def detect_on_chunk(x_chunk, fs, chunk_s):
     # smoothing window
     k = max(1, int(round(SMOOTH_S / HOP_S)))
 
+    # ---------------- New per-frame features: SFM, CREST, SNR ----------------
+    eps = 1e-12
+
+    # Analysis bands
+    B_ALL  = (f_axis >= 20.0) & (f_axis <= 300.0)
+    B_CALL = (f_axis >= 30.0) & (f_axis <= 120.0)
+    B_LOW  = (f_axis >= 20.0) & (f_axis < 100.0)
+    B_HIGH = (f_axis >= 100.0) & (f_axis <= 300.0)
+
+    Sb_all = P[B_ALL, :] + eps
+
+    # Crest factor per frame (peak / mean in analysis band)
+    peak  = Sb_all.max(axis=0)
+    meanp = Sb_all.mean(axis=0)
+    crest = peak / (meanp + eps)
+
+    # Spectral flatness per frame (GM / AM in analysis band)
+    gm = np.exp(np.mean(np.log(Sb_all), axis=0))
+    am = meanp
+    sfm = gm / (am + eps)
+
+    # Local SNR per frame using band energies (call band vs side bands)
+    P_call = P[B_CALL, :].mean(axis=0) + eps
+    P_low  = P[B_LOW,  :].mean(axis=0) + eps
+    P_high = P[B_HIGH, :].mean(axis=0) + eps
+    snr_db = 10.0 * np.log10(P_call / ((P_low + P_high) * 0.5))
+
     # entropy-based tonality in mid band (ST/MT focus)
     ENT_BAND = (70.0, 160.0)
     ent_mid  = band_entropy_tonality(P, f_axis, ENT_BAND)
@@ -883,23 +1036,36 @@ def detect_on_chunk(x_chunk, fs, chunk_s):
     td_slope_hzs = downsweep_slope_hz_per_s(P, f_axis, HOP_S, band=TD_BAND)  # exported only
     td_energy    = P[band_mask(f_axis, *TD_BAND), :].sum(axis=0)             # exported only
 
+
+
+
     # rolling z-scores
-    z_rms  = rz_rms( median_filter(rms,      size=k) )
-    z_flux = rz_flux(median_filter(flux,     size=k) )
+    z_td_energy = rz_td_energy(median_filter(td_energy, size=k))
     z_nb   = rz_nb(  median_filter(nb_ratio, size=k) )
     z_tone = rz_tone(median_filter(tonality, size=k))
+    z_crest = rz_crest(median_filter(crest,  size=k))
+    z_sfm   = rz_sfm(  median_filter(sfm,    size=k))
+    z_snr   = rz_snr(  median_filter(snr_db, size=k))
 
-    # weights tuned for recall on tonal ST/MT
-    W_RMS, W_FLUX, W_NB, W_TONE = 0.10, 0.05, 0.50, 0.35
-    z = (W_RMS*z_rms + W_FLUX*z_flux + W_NB*z_nb + W_TONE*z_tone).astype(np.float32)
 
-    # CPD → candidates
+
+    # -------- Anchor-aligned CPD mix (your requested weights) --------
+    # z(t) = 0.45·z_nb + 0.30·z_tone + 0.15·z_snr + 0.05·z_crest − 0.05·z_sfm
+    z = (0.45 * z_nb
+        + 0.30 * z_tone
+        + 0.15 * z_snr
+        + 0.05 * z_crest
+        + 0.1 * z_td_energy
+        - 0.05 * z_sfm).astype(np.float32)
+    
+
+
+    # CPD → candidates  (z-only)
     min_size_frames = max(3, int(round(MIN_EVENT_S / HOP_S)))
-    n_frames_here = len(z)
+    n_frames_here   = len(z)
 
-    # scale penalty to the configured chunk length (single source of truth)
     BASE_N = int(round(max(chunk_s, 1e-6) / HOP_S))
-    penalty_here = max(1.0, PENALTY * (np.log(max(n_frames_here,2)) / np.log(max(BASE_N,2))))
+    penalty_here = max(1.0, PENALTY * (np.log(max(n_frames_here, 2)) / np.log(max(BASE_N, 2))))
 
     segs = segments_from_cpd(z, HOP_S, penalty_here, model=MODEL, min_size_frames=min_size_frames)
     dets = pick_event_segments(z, segs, Z_THRESH, MIN_EVENT_S, MIN_GAP_S, HOP_S)
@@ -971,6 +1137,9 @@ def detect_on_chunk(x_chunk, fs, chunk_s):
     dets = accepted
     print(f"Rescued by entropy: {rescue_ct}")
 
+
+
+
     # return only what's needed by the orchestrator
     return dets, nb_ratio, tonality, rms, flux, td_slope_hzs, td_energy, times, z
 
@@ -1022,11 +1191,25 @@ def run_streaming(audio_path: Path,
         # detect on the PADDED chunk
         dets_local, nb_ratio, tonality, rms, flux, td_slope_hzs, td_energy, times_local, z_local = detect_on_chunk(x, fs, chunk_s)
 
+        # convert to absolute time using padded t0
+        t0_padded = read_start / fs  # absolute start time (s) of THIS padded chunk
+
+        t_abs    = t0_padded + times_local[:len(z_local)]        # absolute time for each z sample
+        dets_abs = [(t0_padded + st, t0_padded + en) for (st, en) in dets_local]
+
+        # stash for final plot (single figure after all chunks)
+        if PLOT_AT_END:
+            plot_accum["t"].append(t_abs.astype(np.float32))
+            plot_accum["z"].append(z_local.astype(np.float32))
+
+            plot_accum["dets"].extend(dets_abs)        # show ALL dets from this chunk
+            # or: plot_accum["dets"].extend(kept_abs)  # if you prefer only ownership-window dets
+
         # map local → global using padded t0
-        t0_padded = read_start / fs
         dets_global = [[t0_padded + st, t0_padded + en] for (st, en) in dets_local]
 
         t_z_global = t0_padded + times_local[:len(z_local)]
+
 
         # Example: stash one 30 s window around 60 s for the overlay figure
         if 't_z' not in globals():
@@ -1097,6 +1280,40 @@ def run_streaming(audio_path: Path,
     # Save detections
     pd.DataFrame(merged, columns=["start_s","end_s"]).to_csv(out_csv, index=False)
     print(f"\nSaved detections: {out_csv} (n={len(merged)})")
+
+    # --- Final stitched z plot with only final detections ---
+    if PLOT_AT_END and plot_accum["t"]:
+        T = np.concatenate(plot_accum["t"])
+        Z = np.concatenate(plot_accum["z"])
+
+        # handy y-lims so the raster bar has space above the data
+        zmin = float(np.min(Z))
+        zmax = float(np.max(Z))
+        pad  = 0.06 * max(1.0, zmax - zmin)
+
+        plt.figure(figsize=(12, 3.2), dpi=200)
+        plt.plot(T, Z, lw=0.8, color="black", alpha=0.8, label="z-score")
+
+        # 1) shaded spans for each final detection
+        for (st, en) in merged:
+            plt.axvspan(st, en, color="tab:green", alpha=0.18, lw=1.0)
+
+        # 2) a thin “raster” bar at the top to emphasise detections
+        ybar = zmax + pad * 0.6
+        for (st, en) in merged:
+            plt.hlines(ybar, st, en, linewidth=3)
+
+        plt.ylim(zmin - pad, zmax + pad * 1.6)
+        plt.title("Full-stream z with final detections")
+        plt.xlabel("Time (s)"); plt.ylabel("z-score")
+        plt.legend(loc="upper right")
+        plt.tight_layout()
+
+        Path(PLOT_SAVEPATH).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(PLOT_SAVEPATH, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"[debug] Saved final z-plot → {PLOT_SAVEPATH}")
+
 
     # Save Raven TSV
     raven_tsv = out_csv.with_suffix(".raven.tsv")
